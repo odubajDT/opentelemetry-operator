@@ -20,6 +20,20 @@ The allocator will **scrape each collector's Prometheus `/metrics` endpoint** to
 
 The allocator will periodically (every 60s) scrape each collector and parse `scrape_samples_scraped` to build a weight map.
 
+#### Per-target weight granularity
+
+The `scrape_samples_scraped` metric is labeled with the target identity (`job` and `instance`), so the TA gets **per-target** precision — not just per-collector aggregates:
+
+```
+# On collector-1's /metrics endpoint:
+scrape_samples_scraped{job="heavy-targets", instance="10.0.1.5:8080"} 500
+scrape_samples_scraped{job="heavy-targets", instance="10.0.1.6:8080"} 500
+scrape_samples_scraped{job="light-targets", instance="10.0.2.1:9090"} 10
+scrape_samples_scraped{job="light-targets", instance="10.0.2.2:9090"} 10
+```
+
+From this, the TA builds a map `{targetHash → sampleCount}` — "target X produces 500 samples, target Y produces 10." This per-target granularity is what powers the bounded-load algorithm: when the ring calls `GetCollectorForTarget(targetKey, targetWeight)`, the `targetWeight` is the actual observed weight for that specific target.
+
 ### Weight Metric
 
 `scrape_samples_scraped` (number of time series returned per scrape) is used as the weight. It is a stable, directly proportional proxy for collector resource usage (memory for series, CPU for processing, network for export). Unlike `scrape_duration_seconds`, it is not affected by transient network latency.

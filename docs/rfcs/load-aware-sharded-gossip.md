@@ -33,60 +33,23 @@ The foundational paper is *"Epidemic Algorithms for Replicated Database Maintena
 
 ### 3. Last-Writer-Wins Register (CRDT) for Conflict-Free Merge
 
-Each collector weight has **exactly one authoritative writer** — the TA replica assigned to scrape it. This means there are no write conflicts by construction. The weight entry is a **Last-Writer-Wins Register** CRDT (Shapiro et al., *"A Comprehensive Study of Convergent and Commutative Replicated Data Types"*, 2011):
+Each target weight has **exactly one authoritative writer** — the TA replica assigned to scrape the collector that owns that target. This means there are no write conflicts by construction. The weight entry is a **Last-Writer-Wins Register** CRDT (Shapiro et al., *"A Comprehensive Study of Convergent and Commutative Replicated Data Types"*, 2011):
 
 ```
 LWW-Register {
-    Value:     float64    // EMA-smoothed weight
+    Value:     float64    // EMA-smoothed per-target weight (scrape_samples_scraped)
     Timestamp: int64      // epoch when this was scraped
     Writer:    string     // TA pod that wrote it (authoritative owner)
 }
 ```
 
-When a TA receives a weight entry from a peer, the merge rule is trivial: **higher timestamp wins**. Since only one TA writes each key, there's never a true conflict — the gossip is purely disseminating authoritative values.
+The key is the **target identity** (job + instance hash), not the collector name. This gives every TA exact per-target weights — the same precision as single-replica mode.
+
+When a TA receives a weight entry from a peer, the merge rule is trivial: **higher timestamp wins**. Since only one TA writes each key (the TA that scrapes the collector hosting that target), there's never a true conflict — the gossip is purely disseminating authoritative values.
 
 ## Design
 
 ### Architecture Overview
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'fontSize': '13px', 'background': '#ffffff' }}}%%
-flowchart TD
-    subgraph partition["1. Sharded Scraping (Dynamo-style)"]
-        direction LR
-        P1["TA-0\nscrapes col-0..6\n(7 of 20)"]
-        P2["TA-1\nscrapes col-7..13\n(7 of 20)"]
-        P3["TA-2\nscrapes col-14..19\n(6 of 20)"]
-    end
-
-    subgraph gossip["2. Gossip Dissemination (Anti-Entropy)"]
-        direction LR
-        G1["Each TA pulls from\n1 random peer\nevery 10s"]
-        G2["Exchange:\nDIGEST → metadata\nDELTA → missing weights"]
-        G3["LWW-Register CRDT:\nhigher epoch wins\n(no conflicts)"]
-        G1 --- G2 --- G3
-    end
-
-    subgraph converge["3. Convergence → Identical Allocation"]
-        direction LR
-        CV1["All TAs have\nsame weight table"]
-        CV2["Same weights →\nsame hash ring"]
-        CV3["Same ring →\nidentical target\nassignments"]
-        CV1 --> CV2 --> CV3
-    end
-
-    partition --> gossip --> converge
-
-    style P1 fill:#264653,color:#fff
-    style P2 fill:#264653,color:#fff
-    style P3 fill:#264653,color:#fff
-    style G1 fill:#2a9d8f,color:#fff
-    style G2 fill:#2a9d8f,color:#fff
-    style G3 fill:#2a9d8f,color:#fff
-    style CV1 fill:#e9c46a,color:#000
-    style CV2 fill:#f4a261,color:#000
-    style CV3 fill:#2d6a4f,color:#fff
-```
 
 ```
                     ┌─────────────────────────────────┐
@@ -180,18 +143,18 @@ TA-2: scrapes col-2, col-5, col-8, col-11, ... (400 collectors)
 ...
 ```
 
-Each scrape produces a weight observation:
+Each scrape produces per-target weight observations by parsing `scrape_samples_scraped` labels:
 
 ```go
 type WeightEntry struct {
-    CollectorName string  `json:"collector"`
-    Weight        float64 `json:"weight"`     // EMA-smoothed
-    Epoch         int64   `json:"epoch"`       // Unix time / 60
-    Writer        string  `json:"writer"`      // TA pod name
+    TargetKey  string  `json:"target"`    // target identity (hash of job + instance)
+    Weight     float64 `json:"weight"`    // EMA-smoothed scrape_samples_scraped
+    Epoch      int64   `json:"epoch"`     // Unix time / 60
+    Writer     string  `json:"writer"`    // TA pod name (scraper of the hosting collector)
 }
 ```
 
-After scraping, the TA writes entries to its **local weight table** — a `map[string]WeightEntry` keyed by collector name.
+After scraping, the TA writes entries to its **local weight table** — a `map[string]WeightEntry` keyed by target identity. A single collector hosting 10 targets produces 10 weight entries with exact per-target sample counts.
 
 #### 4. Gossip Exchange
 
@@ -270,7 +233,7 @@ This fits well within the 60-second scrape epoch.
 
 ### Merge Rule: Why Determinism is Guaranteed
 
-The critical insight: **each collector weight key has exactly one authoritative writer** (the TA assigned to scrape it). This makes the merge rule trivial and conflict-free:
+The critical insight: **each target weight key has exactly one authoritative writer** — the TA assigned to scrape the collector that currently hosts that target. This makes the merge rule trivial and conflict-free:
 
 ```go
 func mergeEntry(local, remote WeightEntry) WeightEntry {
@@ -284,9 +247,11 @@ func mergeEntry(local, remote WeightEntry) WeightEntry {
 }
 ```
 
-Since `Writer` is deterministic (assigned by hash of collector name) and `Epoch` advances monotonically, all TAs that receive the same set of gossip messages converge to the **exact same weight table** — regardless of message ordering.
+Since `Writer` is deterministic (the TA scraping the hosting collector) and `Epoch` advances monotonically, all TAs that receive the same set of gossip messages converge to the **exact same weight table** — regardless of message ordering.
 
 This is a **Last-Writer-Wins Register CRDT** with the additional guarantee that there's only one writer per key, so the "conflict resolution" path (same epoch, different writer) never triggers in normal operation — it's a safety net for partition reassignment during TA scale events.
+
+**Note on target migration:** When the allocator moves a target from collector A to collector B, the authoritative writer for that target's weight changes from the TA scraping A to the TA scraping B. The next scrape cycle produces a new entry with a higher epoch, which naturally supersedes the old one via the LWW merge rule.
 
 ### Handling Edge Cases
 
@@ -372,7 +337,7 @@ This is **eventually consistent** — the same model as the existing `consistent
 |-----------|--------------|-------------|
 | Peer discovery (`/internal/gossip/discovery.go`) | ~100 | Headless DNS resolution, peer list management |
 | Partition assignment (`/internal/gossip/partition.go`) | ~60 | Hash-based collector-to-TA mapping |
-| Weight table (`/internal/gossip/weights.go`) | ~120 | Thread-safe `map[string]WeightEntry` with LWW merge |
+| Weight table (`/internal/gossip/weights.go`) | ~120 | Thread-safe `map[string]WeightEntry` keyed by target identity, with LWW merge |
 | Gossip protocol (`/internal/gossip/gossip.go`) | ~200 | Digest/delta exchange over HTTP, 10s tick loop |
 | HTTP endpoints (`/internal/gossip/handler.go`) | ~100 | `POST /internal/gossip/digest`, `POST /internal/gossip/delta` |
 | Integration (`/internal/gossip/manager.go`) | ~150 | Wires peer discovery + partition + scraper + gossip + allocator |
@@ -410,15 +375,11 @@ type Manager struct {
 1. **Scrape loop** (every `weight_update_interval`, default 60s): Scrapes only the locally-assigned partition of collectors, stores results in the weight table with `SetLocal()`, then pushes weights to the allocator
 2. **Gossip loop** (every `gossip.interval`, default 10s): Resolves peers via DNS, runs `protocol.RunRound()` to exchange weight data with random peers
 
-**Weight conversion — collector-level to target-level:**
+**Per-target weight precision:**
 
-The gossip weight table stores **per-collector** aggregate weights (total `scrape_samples_scraped` per collector). The allocator expects **per-target** weights. The `WeightTable.SnapshotAsTargetWeights()` method bridges this gap:
+The gossip weight table stores **per-target** weights (individual `scrape_samples_scraped` values parsed from each collector's `/metrics` endpoint). Each target is keyed by its identity (job + instance hash), giving every TA the same exact per-target weights that a single-replica scraper would have — no approximation needed.
 
-```go
-targetWeight = collectorWeight / numTargetsOnCollector
-```
-
-This is an approximation — it assumes targets on a collector contribute equally to its load. This **uniform distribution** is deliberate: using allocation-dependent per-target weights would create a feedback loop where weights change allocations which change weights. After conversion, the Manager applies EMA smoothing (same α as the single-replica scraper) before calling `allocator.UpdateTargetWeights()`.
+The Manager applies EMA smoothing (same α as the single-replica scraper) before calling `allocator.UpdateTargetWeights()`.
 
 Note: When `UpdateTargetWeights()` recalculates caps, it applies a **floor adjustment** — if the heaviest target exceeds the cap that the configured ε would produce, the effective ε is raised so that `cap ≥ max_target_weight`. See the [load-aware-allocation RFC](load-aware-allocation.md) for details.
 
@@ -473,30 +434,32 @@ The two modes are toggled via `load_aware_hashing.gossip.enabled` in the TA conf
 
 ## Memory Footprint Analysis
 
-### Per-collector weight entry in memory
+### Per-target weight entry in memory
 
 ```go
 type WeightEntry struct {
-    CollectorName string   // ~30 bytes avg ("collector-1234")
-    Weight        float64  // 8 bytes
-    Epoch         int64    // 8 bytes
-    Writer        string   // ~20 bytes avg ("ta-standalone-0")
+    TargetKey  string   // ~40 bytes avg (hash of job + instance)
+    Weight     float64  // 8 bytes
+    Epoch      int64    // 8 bytes
+    Writer     string   // ~20 bytes avg ("ta-standalone-0")
 }
 // Go struct overhead: ~16 bytes (header + padding)
 // Go map entry overhead: ~80 bytes (hash bucket, key pointer, value pointer)
-// Total per entry: ~162 bytes
+// Total per entry: ~172 bytes
 ```
 
-### Weight table size by collector count
+### Weight table size by target count
 
-| Collectors | Weight table size | % of typical TA memory (80–150 MB) |
-|------------|------------------|-------------------------------------|
-| 100 | 16 KB | 0.01–0.02% |
-| 500 | 81 KB | 0.05–0.1% |
-| 2,000 | 324 KB | 0.2–0.4% |
-| 10,000 | 1.6 MB | 1–2% |
+With an average of 10 targets per collector:
 
-### Full memory breakdown at 2000 collectors
+| Collectors | Targets | Weight table size | % of typical TA memory (80–150 MB) |
+|------------|---------|------------------|-------------------------------------|
+| 100 | 1,000 | 172 KB | 0.1–0.2% |
+| 500 | 5,000 | 860 KB | 0.6–1.1% |
+| 2,000 | 20,000 | 3.4 MB | 2.3–4.3% |
+| 10,000 | 100,000 | 17.2 MB | 11–22% |
+
+### Full memory breakdown at 2000 collectors (20K targets)
 
 | Component | Memory | New for load-aware? |
 |---|---|---|
@@ -504,13 +467,15 @@ type WeightEntry struct {
 | Target items (10 targets/collector avg, 20K total) | 1.6 MB | No |
 | Hash ring (150 vnodes/collector) | 960 KB | No |
 | Scrape config cache | ~200 KB | No |
-| **Weight table** | **324 KB** | **Yes** |
-| **Gossip peer state (5 TAs × digest)** | **~2 KB** | **Yes** |
-| **Total** | **~3.5 MB** | |
+| **Weight table (20K targets)** | **3.4 MB** | **Yes** |
+| **Gossip peer state (5 TAs × digest)** | **~20 KB** | **Yes** |
+| **Total** | **~6.6 MB** | |
 
-The weight table adds **324 KB** at 2000 collectors — less than 10% of the allocator's total data structures and under 0.4% of overall TA process memory. This is identical regardless of whether weights are delivered via gossip or ConfigMap watch — every replica must hold the full weight map in memory to compute the hash ring.
+The weight table adds **3.4 MB** at 20K targets — ~10x more than per-collector gossip would use, but still under 5% of typical TA process memory. The tradeoff is worth it: every TA gets exact per-target weights, eliminating the lossy approximation that per-collector gossip required.
 
-Memory is not a bottleneck for this design. The constraint at scale is **scrape CPU time** (parsing Prometheus exposition responses), which is exactly what sharding solves.
+At extreme scale (100K+ targets), the weight table becomes significant (~17 MB). For these cases, consider increasing TA memory limits or using delta-compressed gossip (only transmit changed entries).
+
+Memory is manageable for this design at typical scale. The constraint at scale is **scrape CPU time** (parsing Prometheus exposition responses), which is exactly what sharding solves.
 
 ### Gossip Convergence Analysis
 
@@ -564,30 +529,35 @@ Each gossip exchange starts with a **digest** — a compact summary of what the 
 
 ```
 Digest = []DigestEntry{
-    {CollectorName string, Epoch int64, Writer string}
+    {TargetKey string, Epoch int64, Writer string}
 }
 ```
 
-Per entry: ~30 bytes (collector name) + 8 bytes (epoch) + ~20 bytes (writer) + ~10 bytes (protobuf/JSON framing) = **~68 bytes/entry**.
+Per entry: ~40 bytes (target key) + 8 bytes (epoch) + ~20 bytes (writer) + ~10 bytes (JSON framing) = **~78 bytes/entry**.
 
-For 2000 collectors: `2000 × 68 = ~136 KB` per digest.
+For 2000 collectors with 10 targets each (20K targets): `20,000 × 78 = ~1.56 MB` per digest.
 
 #### Delta response
 
-After comparing digests, the responder sends only **missing or newer entries** (full `WeightEntry` with the `float64` weight value). In steady state after initial convergence, deltas are small — only entries updated since the last exchange, typically the sender's own partition (~collectors/N).
+After comparing digests, the responder sends only **missing or newer entries** (full `WeightEntry` with the `float64` weight value). In steady state after initial convergence, deltas are small — only entries updated since the last exchange, typically the sender's own partition (~targets on scraped collectors).
 
-For 2000 collectors with 5 TAs, each TA scrapes ~400 collectors. A delta after one epoch contains ~400 entries × 76 bytes = **~30 KB**.
+For 2000 collectors with 5 TAs, each TA scrapes ~400 collectors × ~10 targets = ~4000 targets. A delta after one epoch contains ~4000 entries × 86 bytes = **~344 KB**.
 
 #### Gossip bandwidth by scale
 
-Per gossip round, each TA initiates `fan-out` pull requests. Each pull = 1 digest sent + 1 delta received.
+Per gossip round, each TA initiates `fan-out` pull requests. Each pull = 1 digest sent + 1 delta received. Targets = collectors × 10 (average).
 
-| TA replicas | Collectors | Fan-out | Digest size | Steady-state delta | Traffic/TA/round | Traffic/TA/min (10s interval) |
-|---|---|---|---|---|---|---|
-| 3 | 500 | 1 | 34 KB | 12 KB | 46 KB | 276 KB |
-| 5 | 2,000 | 1 | 136 KB | 30 KB | 166 KB | 996 KB (~1 MB) |
-| 10 | 5,000 | 1 | 340 KB | 38 KB | 378 KB | 2.3 MB |
-| 20 | 10,000 | 2 | 680 KB | 38 KB | 1.4 MB | 8.6 MB |
+| TA replicas | Collectors | Targets | Fan-out | Digest size | Steady-state delta | Traffic/TA/round | Traffic/TA/min (10s interval) |
+|---|---|---|---|---|---|---|---|
+| 3 | 500 | 5K | 1 | 390 KB | 143 KB | 533 KB | 3.2 MB |
+| 5 | 2,000 | 20K | 1 | 1.56 MB | 344 KB | 1.9 MB | 11.4 MB |
+| 10 | 5,000 | 50K | 1 | 3.9 MB | 430 KB | 4.3 MB | 25.8 MB |
+| 20 | 10,000 | 100K | 2 | 7.8 MB | 430 KB | 16.5 MB | 99 MB |
+
+**Note:** At large scale (10K+ collectors), digest sizes become the dominant cost. This can be mitigated by:
+- **Digest compression**: gzip reduces digest size by ~60–70% (repetitive structure)
+- **Bloom filter digests**: instead of full key listing, send a Bloom filter of `(targetKey, epoch)` pairs — reduces digest to ~2 bits/entry
+- **Incremental digests**: only include entries that changed since the last exchange with that peer
 
 #### Comparison with single-replica scraper
 
@@ -597,10 +567,10 @@ Per gossip round, each TA initiates `fan-out` pull requests. Each pull = 1 diges
 | Bottleneck | Single TA CPU/memory for all scrapes | Distributed — each TA scrapes ~1/N |
 | Data transferred | None (all local) | Incremental deltas only (peer-to-peer) |
 | API server load | Zero | Zero |
-| Network per TA/min | Zero | ~1 MB (digests + deltas, 6×/min at 2000 collectors) |
+| Network per TA/min | Zero | ~11 MB (digests + deltas, 6×/min at 2000 collectors / 20K targets) |
 | Failure domain | Scraper TA dies → stale weights | Peer down → skip, converge next round |
 
-At moderate scale (5 TAs, 2000 collectors), gossip adds ~1 MB/min network overhead but:
+At moderate scale (5 TAs, 2000 collectors, 20K targets), gossip adds ~11 MB/min network overhead per TA but:
 - **Distributed scraping** — each TA handles only ~400 collectors instead of 2000
 - **Zero API server load** — critical in large clusters where etcd is the bottleneck
 - **Incremental** — only deltas flow after initial sync, so actual bytes are smaller in practice
