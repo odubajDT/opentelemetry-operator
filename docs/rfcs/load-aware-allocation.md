@@ -32,6 +32,37 @@ A new strategy built on **consistent hashing with bounded loads** (based on [Mir
 
 1. **Hash ring with virtual nodes** — Each collector gets `V` virtual nodes on the ring (default: V = 100), hashed using `xxhash.Sum64String()`. Targets are hashed to a position on the ring and assigned to the next collector clockwise, exactly like the existing `consistent-hashing` strategy.
 
+   **Visual example** — 3 collectors (A, B, C) with 4 virtual nodes each on a simplified ring:
+
+   ```
+   Sorted virtual nodes on the ring:
+
+   0     1500  2300  3100  4200  5000  5600  6900  7200  7800  8500  9100  9800
+    ──────A─────B─────C─────A─────C─────B─────B─────C─────A─────B─────A─────C──→
+
+   A target hashes to a position and walks clockwise to the first node:
+
+   hash("http://10.0.1.5:8080/metrics") = 5100
+
+                                 target
+                                   ↓
+   0     1500  2300  3100  4200  5100  5600  6900  7200  7800  8500  9100  9800
+    ──────A─────B─────C─────A─────┃──→──B─────B─────C─────A─────B─────A─────C──→
+                                  └─walks─→─found!
+                                           collector B owns this target
+
+   With bounded load — if B is at cap, skip to next available collector:
+
+                                 target
+                                   ↓
+   0     1500  2300  3100  4200  5100  5600  6900  7200  7800  8500  9100  9800
+    ──────A─────B─────C─────A─────┃──→──B─────B─────C─────A─────B─────A─────C──→
+                                  └─────skip──skip──→──C
+                                        (B full)      assigned! (spilled from B)
+   ```
+
+   With V=100 virtual nodes per collector (the default), each collector gets ~100 small segments spread evenly around the ring, ensuring balanced distribution. The target's hash position is deterministic — same input always produces the same position — which is why targets are inherently **sticky** to their collector.
+
 2. **Bounded load cap** — Each collector has a capacity cap (minimum 1.0 to ensure cold-start targets can be assigned):
    ```
    fair_share   = total_weight / num_collectors
