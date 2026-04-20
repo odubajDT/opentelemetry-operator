@@ -1,0 +1,141 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: ta-loadtest
+data:
+  collector.yaml: |
+    receivers:
+      prometheus:
+        config: {}
+        target_allocator:
+          collector_id: ${env:POD_NAME}
+          endpoint: http://target-allocator.ta-loadtest.svc.cluster.local:80
+          interval: 10s
+          timeout: 8s
+
+    exporters:
+      # nop-like: debug with no output (minimal overhead)
+      debug:
+        verbosity: basic
+        sampling_initial: 0
+        sampling_thereafter: 0
+      # Uncomment for debugging:
+      # debug:
+      #   verbosity: detailed
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        metrics:
+          receivers: [prometheus]
+          exporters: [debug]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: otel-collector
+  namespace: ta-loadtest
+  labels:
+    app: otel-collector
+spec:
+  serviceName: otel-collector
+  replicas: 2
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+        - name: collector
+          image: otel-collector:latest
+          imagePullPolicy: Never
+          args: ["--config=/conf/collector.yaml"]
+          ports:
+            - containerPort: 8888
+              name: metrics
+              protocol: TCP
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: collector-config
+              mountPath: /conf
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 4Gi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            initialDelaySeconds: 10
+      volumes:
+        - name: collector-config
+          configMap:
+            name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: ta-loadtest
+spec:
+  clusterIP: None
+  selector:
+    app: otel-collector
+  ports:
+    - name: metrics
+      port: 8888
+      targetPort: metrics
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: otel-collector
+  namespace: ta-loadtest
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: otel-collector
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60

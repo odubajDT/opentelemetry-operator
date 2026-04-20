@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: avalanche
+  namespace: ta-loadtest
+  labels:
+    app: avalanche
+spec:
+  replicas: 40
+  selector:
+    matchLabels:
+      app: avalanche
+  template:
+    metadata:
+      labels:
+        app: avalanche
+    spec:
+      containers:
+        - name: avalanche
+          image: quay.io/prometheuscommunity/avalanche:latest
+          imagePullPolicy: Never
+          args:
+            - "--gauge-metric-count=200"
+            - "--counter-metric-count=200"
+            - "--histogram-metric-count=50"
+            - "--histogram-metric-bucket-count=8"
+            - "--native-histogram-metric-count=0"
+            - "--summary-metric-count=50"
+            - "--summary-metric-objective-count=2"
+            - "--series-count=30"
+            - "--value-interval=30"
+            - "--series-interval=3600"
+            - "--metric-interval=0"
+            - "--port=9001"
+          ports:
+            - containerPort: 9001
+              name: metrics
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 50m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: avalanche
+  namespace: ta-loadtest
+  labels:
+    app: avalanche
+spec:
+  clusterIP: None
+  selector:
+    app: avalanche
+  ports:
+    - name: metrics
+      port: 9001
+      targetPort: metrics
+      protocol: TCP

@@ -1,0 +1,125 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: target-allocator
+  namespace: ta-loadtest
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ta-loadtest-target-allocator
+rules:
+  - apiGroups: [""]
+    resources: [pods, nodes, namespaces, services, endpoints]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - nonResourceURLs: [/metrics]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ta-loadtest-target-allocator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ta-loadtest-target-allocator
+subjects:
+  - kind: ServiceAccount
+    name: target-allocator
+    namespace: ta-loadtest
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: target-allocator
+  namespace: ta-loadtest
+data:
+  targetallocator.yaml: |
+    allocation_strategy: consistent-hashing
+    filter_strategy: relabel-config
+    collector_selector:
+      matchLabels:
+        app: otel-collector
+    config:
+      scrape_configs:
+        - job_name: avalanche
+          scrape_interval: 15s
+          dns_sd_configs:
+            - names:
+                - avalanche.ta-loadtest.svc.cluster.local
+              type: A
+              port: 9001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: target-allocator
+  namespace: ta-loadtest
+  labels:
+    app.kubernetes.io/name: target-allocator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: target-allocator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: target-allocator
+    spec:
+      serviceAccountName: target-allocator
+      containers:
+        - name: target-allocator
+          image: target-allocator:latest
+          imagePullPolicy: Never
+          args: ["--config-file=/conf/targetallocator.yaml"]
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          env:
+            - name: OTELCOL_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: ta-config
+              mountPath: /conf
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+      volumes:
+        - name: ta-config
+          configMap:
+            name: target-allocator
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: target-allocator
+  namespace: ta-loadtest
+spec:
+  selector:
+    app.kubernetes.io/name: target-allocator
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
